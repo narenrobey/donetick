@@ -140,16 +140,5 @@ func (i *IdentityProvider) GetUserInfo(ctx context.Context, accessToken string) 
 
 // Check if the provided URL is reachable and returns a valid image
 func isPictureURLValid(url string) bool {
-	resp, err := http.Get(url)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	return strings.HasPrefix(contentType, "image/")
+	return url != "" // self-hosted: skip outbound HTTP avatar check
 }
