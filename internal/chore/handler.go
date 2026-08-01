@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -38,8 +39,6 @@ import (
 	"donetick.com/core/internal/utils"
 	"donetick.com/core/logging"
 	"github.com/gin-gonic/gin"
-	"github.com/gin-gonic/gin/binding"
-	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
 )
 
@@ -56,17 +55,19 @@ type Handler struct {
 	eventProducer   *events.EventsProducer
 	stRepo          *stRepo.SubTasksRepository
 	storageRepo     *storageRepo.StorageRepository
-	storage         *storage.S3Storage
+	storage         storage.Storage
 	realTimeService *realtime.RealTimeService
+	signer          storage.URLSigner
 }
 
 func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository, nt *notifier.Notifier,
 	np *nps.NotificationPlanner, nRepo *nRepo.NotificationRepository, tRepo *tRepo.ThingRepository, lRepo *lRepo.LabelRepository,
 	ep *events.EventsProducer, stRepo *stRepo.SubTasksRepository,
-	storage *storage.S3Storage,
+	stor storage.Storage,
 	ur *uRepo.UserRepository,
 	dr *dRepo.DeviceRepository,
 	stoRepo *storageRepo.StorageRepository,
+	signer storage.URLSigner,
 	rts *realtime.RealTimeService) *Handler {
 	return &Handler{
 		choreRepo:       cr,
@@ -81,7 +82,8 @@ func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository, 
 		eventProducer:   ep,
 		stRepo:          stRepo,
 		storageRepo:     stoRepo,
-		storage:         storage,
+		storage:         stor,
+		signer:          signer,
 		realTimeService: rts,
 	}
 }
@@ -96,6 +98,7 @@ func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository, 
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			includeArchived	query		boolean						false	"Include archived chores"
+//	@Param			includeSubtasks	query		boolean						false	"Include subtasks for chore"
 //	@Success		200				{object}	map[string][]chModel.Chore	"res: array of chores"
 //	@Failure		401				{object}	map[string]string			"error: Authentication failed"
 //	@Failure		500				{object}	map[string]string			"error: Failed to retrieve chores"
@@ -111,12 +114,17 @@ func (h *Handler) GetChores(c *gin.Context) {
 		return
 	}
 	includeArchived := false
+	includeSubtasks := false
+
+	if c.Query("includeSubtasks") == "true" {
+		includeSubtasks = true
+	}
 
 	if c.Query("includeArchived") == "true" {
 		includeArchived = true
 	}
 
-	chores, err := h.choreRepo.GetChores(c, u.CircleID, u.ID, includeArchived, nil)
+	chores, err := h.choreRepo.GetChores(c, u.CircleID, u.ID, includeArchived, nil, includeSubtasks)
 	if err != nil {
 		logger.Error("Failed to retrieve chores", "error", err, "userID", u.ID, "circleID", u.CircleID, "includeArchived", includeArchived)
 		c.JSON(500, gin.H{
@@ -225,10 +233,71 @@ func (h *Handler) GetChore(c *gin.Context) {
 		})
 		return
 	}
-
+	if chore.Description != nil {
+		// see if we have an <img> tag with attribute dt-data-path if so resigned the url using it's value and replace the src:
+		updatedDescription := h.generateUpdatedSignedDescription(c, *chore.Description)
+		chore.Description = &updatedDescription
+	}
+	h.signAttachments(c, chore.Attachments)
 	c.JSON(200, gin.H{
 		"res": chore,
 	})
+}
+
+func (h *Handler) generateUpdatedSignedDescription(c *gin.Context, description string) string {
+	logger := logging.FromContext(c)
+	reg := regexp.MustCompile(`<img[^>]+dt-data-path="([^">]+)"[^>]*>`)
+	matches := reg.FindAllStringSubmatch(description, -1)
+	if len(matches) > 0 {
+		for _, match := range matches {
+			if len(match) > 1 {
+				originalDataPath := match[1]
+				// Strip any existing query parameters to get the clean path
+				cleanPath := originalDataPath
+				if idx := strings.Index(cleanPath, "?"); idx != -1 {
+					cleanPath = cleanPath[:idx]
+				}
+
+				// Sign the clean path to get a fresh signed URL
+				newURL, err := h.signer.Sign(cleanPath)
+				if err != nil {
+					logger.Error("Failed to get signed URL for image", "error", err, "dtDataPath", cleanPath)
+					continue
+				}
+
+				// Update the img tag: ensure dt-data-path has clean path and src has signed URL
+				oldImgTag := match[0]
+				newImgTag := oldImgTag
+
+				// If dt-data-path had query params, update it to the clean path
+				if originalDataPath != cleanPath {
+					newImgTag = strings.Replace(newImgTag, fmt.Sprintf(`dt-data-path="%s"`, originalDataPath), fmt.Sprintf(`dt-data-path="%s"`, cleanPath), 1)
+				}
+
+				// Update the src attribute to have the new signed URL
+				// Match src="..." and replace its value
+				srcReg := regexp.MustCompile(`src="[^"]*"`)
+				newImgTag = srcReg.ReplaceAllString(newImgTag, fmt.Sprintf(`src="%s"`, newURL))
+
+				description = strings.Replace(description, oldImgTag, newImgTag, 1)
+			}
+		}
+	}
+	return description
+}
+
+// signAttachments populates a fetchable signed URL on each attachment record
+// before it is serialized to a client.
+func (h *Handler) signAttachments(c *gin.Context, attachments []storageModel.StorageFile) {
+	logger := logging.FromContext(c)
+	for i := range attachments {
+		signed, err := h.signer.Sign(attachments[i].FilePath)
+		if err != nil {
+			logger.Error("Failed to sign attachment url", "error", err, "path", attachments[i].FilePath)
+			continue
+		}
+		attachments[i].Sign = signed
+	}
 }
 
 // UpdatedAt is for internal use only when syncing a chore updated offline
@@ -238,11 +307,11 @@ type ChoreReq struct {
 	ID                   int                           `json:"id"`
 	Name                 string                        `json:"name" binding:"required"`
 	FrequencyType        chModel.FrequencyType         `json:"frequencyType" binding:"required,oneof=once daily weekly monthly yearly adaptive interval days_of_the_week day_of_the_month trigger no_repeat"`
-	Frequency            *int                          `json:"frequency" binding:"omitempty,gt=0"`
-	FrequencyMetadata    *chModel.FrequencyMetadata    `json:"frequencyMetadata"`
-	NextDueDate          *time.Time                    `json:"nextDueDate" binding:"required_with=IsRolling"` // Next due date in RFC3339 format
+	Frequency            *int                          `json:"frequency" binding:"omitempty"`
+	FrequencyMetadata    *chModel.FrequencyMetadata    `json:"frequencyMetadata,omitempty"`
+	NextDueDate          *time.Time                    `json:"nextDueDate" binding:"omitempty,required_with=IsRolling"` // Next due date in RFC3339 format
 	IsRolling            bool                          `json:"isRolling"`
-	AssignedTo           *int                          `json:"assignedTo" binding:"omitempty,gt=0"`
+	AssignedTo           *int                          `json:"assignedTo" binding:"omitempty"`
 	Assignees            []chModel.ChoreAssignees      `json:"assignees" binding:"dive"`
 	AssignStrategy       chModel.AssignmentStrategy    `json:"assignStrategy" binding:"required,oneof=no_assignee least_assigned least_completed random keep_last_assigned random_except_last_assigned round_robin"`
 	IsActive             *bool                         `json:"isActive" binding:"omitempty"`
@@ -250,15 +319,16 @@ type ChoreReq struct {
 	NotificationMetadata *chModel.NotificationMetadata `json:"notificationMetadata"`
 	LabelsV2             *[]lModel.LabelReq            `json:"labelsV2" binding:"omitempty,unique=LabelID,dive"`
 	UpdatedAt            *time.Time                    `json:"updatedAt"`
-	Priority             *int                          `json:"priority" binding:"omitempty,gte=0,lte=5"`
-	CompletionWindow     *int                          `json:"completionWindow" binding:"omitempty,min=0"`
-	Points               *int                          `json:"points" binding:"omitempty,gte=0"`
+	Priority             *int                          `json:"priority" binding:"omitempty"`
+	CompletionWindow     *int                          `json:"completionWindow" binding:"omitempty"`
+	Points               *int                          `json:"points" binding:"omitempty"`
 	Description          *string                       `json:"description" binding:"omitempty"`
 	SubTasks             *[]stModel.SubTask            `json:"subTasks" binding:"omitempty,dive"`
 	RequireApproval      bool                          `json:"requireApproval" binding:"omitempty"`
 	IsPrivate            *bool                         `json:"isPrivate" binding:"omitempty"`
-	ProjectID            *int                          `json:"projectId" binding:"omitempty,gt=0"`
+	ProjectID            *int                          `json:"projectId" binding:"omitempty"`
 	ThingTrigger         *tModel.ThingTrigger          `json:"thingTrigger"`
+	DraftId              *string                       `json:"draftId,omitempty"`
 }
 
 type ActionOptions struct {
@@ -394,7 +464,17 @@ func (h *Handler) CreateChore(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "Failed to retrieve circle users"})
 		return
 	}
-	for _, assignee := range choreReq.Assignees {
+
+	assignees := choreReq.Assignees
+	if len(assignees) == 0 {
+		for _, circleUser := range circleUsers {
+			assignees = append(assignees, chModel.ChoreAssignees{
+				UserID:  circleUser.UserID,
+				ChoreID: choreReq.ID,
+			})
+		}
+	}
+	for _, assignee := range assignees {
 		userFound := false
 		for _, circleUser := range circleUsers {
 			if assignee.UserID == circleUser.UserID {
@@ -409,6 +489,23 @@ func (h *Handler) CreateChore(c *gin.Context) {
 			return
 		}
 
+	}
+
+	//  validate assignedTo is one of the assignees (which are all in the circle):
+	if choreReq.AssignedTo != nil {
+		assigneeFound := false
+		for _, assignee := range assignees {
+			if assignee.UserID == *choreReq.AssignedTo {
+				assigneeFound = true
+				break
+			}
+		}
+		if !assigneeFound {
+			c.JSON(400, gin.H{
+				"error": "Assigned to not found in assignees",
+			})
+			return
+		}
 	}
 	// Remove the auto-assignment logic - if no assignee then keep no assignee
 
@@ -501,6 +598,15 @@ func (h *Handler) CreateChore(c *gin.Context) {
 			return
 		}
 	}
+
+	if choreReq.DraftId != nil && *choreReq.DraftId != "" {
+		if err := h.storageRepo.ReassignDraftAttachments(c, *choreReq.DraftId, currentUser.ID, createdChore.ID); err != nil {
+			logger.Error("Failed to reassign draft attachments", "error", err, "draftID", *choreReq.DraftId)
+			c.JSON(500, gin.H{"error": "Error processing attachments"})
+			return
+		}
+	}
+
 	if len(choreAssignees) > 0 {
 		if err := h.choreRepo.UpdateChoreAssignees(c, choreAssignees); err != nil {
 			c.JSON(500, gin.H{
@@ -668,7 +774,18 @@ func (h *Handler) EditChore(c *gin.Context) {
 	//  validate assignedTo part of the assignees:
 	if choreReq.AssignedTo != nil {
 		assigneeFound := false
-		for _, assignee := range choreReq.Assignees {
+		// if we have assignees loop through them if we don't have any we default to circle as this task assigned to Anyone
+		assignees := choreReq.Assignees
+		if len(assignees) == 0 {
+			// everyone in the circle is considered an assignee, so we check if the assignedTo user is in the circle:
+			for _, circleUser := range circleUsers {
+				if circleUser.UserID == *choreReq.AssignedTo {
+					assigneeFound = true
+					break
+				}
+			}
+		}
+		for _, assignee := range assignees {
 			if assignee.UserID == *choreReq.AssignedTo {
 				assigneeFound = true
 				break
@@ -912,6 +1029,26 @@ func setEditChoreDefaults(choreReq *ChoreReq, oldChore *chModel.Chore) {
 	}
 }
 
+func (h *Handler) deleteChoreFiles(ctx *gin.Context, choreID int) {
+	files, err := h.storageRepo.GetAllFilesByOwnerType(ctx, storageModel.EntityTypeChoreDescription, choreID)
+	if err != nil || len(files) == 0 {
+		return
+	}
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = f.FilePath
+	}
+	h.storage.Delete(ctx, paths)
+
+	byUser := make(map[int][]*storageModel.StorageFile)
+	for _, f := range files {
+		byUser[f.UserID] = append(byUser[f.UserID], f)
+	}
+	for userID, userFiles := range byUser {
+		h.storageRepo.RemoveFileRecords(ctx, userFiles, userID)
+	}
+}
+
 func (h *Handler) cleanUpUnreferencedFiles(ctx *gin.Context, userID int, entityType storageModel.EntityType, entityID int, text string) error {
 	existedFiles, err := h.storageRepo.GetFilesByUser(ctx, userID, entityType, entityID)
 	if err != nil {
@@ -1002,15 +1139,7 @@ func (h *Handler) DeleteChore(c *gin.Context) {
 		})
 		return
 	}
-	// check if the user is the owner of the chore before deleting
-	if err := h.choreRepo.IsChoreOwner(c, id, currentUser.ID); err != nil {
-		c.JSON(403, gin.H{
-			"error": "You are not allowed to delete this chore",
-		})
-		return
-	}
-
-	// Get chore details before deletion for real-time event
+	// Get chore details before deletion for real-time event; scopes to current circle
 	chore, err := h.choreRepo.GetChore(c, id, currentUser.ID, currentUser.CircleID)
 	if err != nil {
 		logger.Error("Failed to retrieve chore", "error", err)
@@ -1019,7 +1148,29 @@ func (h *Handler) DeleteChore(c *gin.Context) {
 		})
 		return
 	}
+	if chore.CreatedBy != currentUser.ID {
+		c.JSON(403, gin.H{
+			"error": "You are not allowed to delete this chore",
+		})
+		return
+	}
 
+	// Collect file paths before deletion; the DeleteChore transaction removes the
+	// DB records, so we must query them first or the backing objects are orphaned.
+	var choreFilePaths []string
+	for _, entityType := range []storageModel.EntityType{
+		storageModel.EntityTypeChoreDescription,
+		storageModel.EntityTypeChoreAttachment,
+	} {
+		files, err := h.storageRepo.GetAllFilesByOwnerType(c, entityType, id)
+		if err != nil {
+			logger.Error("Failed to list chore files for cleanup", "error", err, "choreID", id, "entityType", entityType)
+			continue
+		}
+		for _, f := range files {
+			choreFilePaths = append(choreFilePaths, f.FilePath)
+		}
+	}
 	deletedSyncVersion, err := h.choreRepo.DeleteChore(c, id)
 	if err != nil {
 		logger.Error("Failed to delete chore", "error", err, "choreID", id, "userID", currentUser.ID)
@@ -1030,6 +1181,10 @@ func (h *Handler) DeleteChore(c *gin.Context) {
 	}
 	h.nRepo.DeleteAllChoreNotifications(id)
 	h.tRepo.DissociateChoreWithThing(c, id)
+	// DB records are already gone; only delete the backing storage objects.
+	if len(choreFilePaths) > 0 {
+		h.storage.Delete(c, choreFilePaths)
+	}
 
 	// Broadcast real-time chore deletion event
 	if h.realTimeService != nil {
@@ -1176,6 +1331,9 @@ func (h *Handler) UpdateAssignee(c *gin.Context) {
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			id	path		int						true	"Chore ID"
+//
+// TODO: Add response model
+//
 //	@Success		200	{object}	map[string]interface{}	"res: {timerUpdatedAt, status, duration}"
 //	@Failure		400	{object}	map[string]string		"error: Invalid ID | Chore is not in a state that can be started"
 //	@Failure		401	{object}	map[string]string		"error: Authentication failed"
@@ -1347,6 +1505,9 @@ func (h *Handler) StartChore(c *gin.Context) {
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			id	path		int						true	"Chore ID"
+//
+// TODO: Add response model
+//
 //	@Success		200	{object}	map[string]interface{}	"res: {duration, status, timerUpdatedAt}"
 //	@Failure		400	{object}	map[string]string		"error: Invalid ID | No active time session found for this chore"
 //	@Failure		401	{object}	map[string]string		"error: Authentication failed"
@@ -1487,6 +1648,9 @@ func (h *Handler) PauseChore(c *gin.Context) {
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			id	path		int						true	"Chore ID"
+//
+// TODO: Add response model
+//
 //	@Success		200	{object}	map[string]interface{}	"res: {timerUpdatedAt, status, duration}"
 //	@Failure		400	{object}	map[string]string		"error: Invalid ID | No active time session found for this chore"
 //	@Failure		401	{object}	map[string]string		"error: Authentication failed"
@@ -1907,6 +2071,8 @@ func (h *Handler) ArchiveChore(c *gin.Context) {
 		return
 	}
 
+	h.nRepo.DeleteAllChoreNotifications(id)
+
 	// Broadcast real-time chore archive event
 	if h.realTimeService != nil {
 		updatedChore, err := h.choreRepo.GetChore(c, id, currentUser.ID, currentUser.CircleID)
@@ -2197,7 +2363,7 @@ func (h *Handler) CompleteChore(c *gin.Context) {
 		return
 	}
 
-	nextAssignedTo, err := checkNextAssignee(chore, choreHistory, completedBy)
+	nextAssignedTo, err := checkNextAssignee(chore, choreHistory, completedBy, circleUsers)
 	if err != nil {
 		logging.FromContext(c).Error("Failed to check next assignee", "error", err)
 		c.JSON(500, gin.H{
@@ -2360,6 +2526,9 @@ func (h *Handler) GetChoreHistory(c *gin.Context) {
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			id	path		int						true	"Chore ID"
+//
+// TODO: Add response model
+//
 //	@Success		200	{object}	map[string]interface{}	"res: detailed chore information"
 //	@Failure		400	{object}	map[string]string		"error: Invalid ID"
 //	@Failure		401	{object}	map[string]string		"error: Authentication failed"
@@ -2393,7 +2562,12 @@ func (h *Handler) GetChoreDetail(c *gin.Context) {
 		})
 		return
 	}
-
+	if detailed.Description != nil {
+		// see if we have an <img> tag with attribute dt-data-path if so resigned the url using it's value and replace the src:
+		updatedDescription := h.generateUpdatedSignedDescription(c, *detailed.Description)
+		detailed.Description = &updatedDescription
+	}
+	h.signAttachments(c, detailed.Attachments)
 	c.JSON(200, gin.H{
 		"res": detailed,
 	})
@@ -2784,6 +2958,9 @@ type SubtaskReq struct {
 //	@Security		APIKeyAuth
 //	@Param			id		path		int						true	"Chore ID"
 //	@Param			subtask	body		SubtaskReq				true	"Subtask completion request"
+//
+// TODO: Add response model
+//
 //	@Success		200		{object}	map[string]interface{}	"Empty success response"
 //	@Failure		400		{object}	map[string]string		"error: Invalid Chore ID | Invalid request | User is not assigned to chore"
 //	@Failure		401		{object}	map[string]string		"error: Authentication failed"
@@ -2853,7 +3030,7 @@ func (h *Handler) UpdateSubtaskCompletedAt(c *gin.Context) {
 		})
 		return
 	}
-	err = h.stRepo.UpdateSubTaskStatus(c, effectiveUser.ID, req.ID, req.CompletedAt)
+	err = h.stRepo.UpdateSubTaskStatus(c, effectiveUser.ID, choreID, req.ID, req.CompletedAt)
 	if err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error getting subtask",
@@ -3381,7 +3558,7 @@ func (h *Handler) ApproveChore(c *gin.Context) {
 		}
 	}
 
-	nextAssignedTo, err := checkNextAssignee(chore, allHistory, completedBy)
+	nextAssignedTo, err := checkNextAssignee(chore, allHistory, completedBy, circleUsers)
 	if err != nil {
 		c.JSON(500, gin.H{
 			"error": "Error checking next assignee",
@@ -3446,6 +3623,9 @@ type RejectChoreReq struct { // TODO: Remove "Note" in future.
 //	@Security		APIKeyAuth
 //	@Param			id			path		int						true	"Chore ID"
 //	@Param			rejection	body		RejectChoreReq			false	"Rejection details"
+//
+// TODO: Add response model
+//
 //	@Success		200			{object}	map[string]interface{}	"res: updated chore, message: Chore rejected successfully"
 //	@Failure		400			{object}	map[string]string		"error: Invalid ID | Chore is not pending approval"
 //	@Failure		401			{object}	map[string]string		"error: Authentication failed"
@@ -3786,13 +3966,29 @@ func (h *Handler) updateTimer(c *gin.Context) { // TODO: Not used in Routes
 	})
 }
 
-func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHistory, performerID int) (*int, error) {
+func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHistory, performerID int, circleUsers []*circle.UserCircleDetail) (*int, error) {
 	// copy the history to avoid modifying the original:
 	history := make([]*chModel.ChoreHistory, len(choresHistory))
 	copy(history, choresHistory)
 
+	// "Anyone" chores carry no explicit assignees, so rotate across the whole circle rather
+	// than dropping the assignment: a nil result is persisted verbatim by CompleteChore/
+	// ApproveChore/SkipChore, and the notification planner only emits for an assigned user,
+	// so dropping it would silence the chore. no_assignee is excluded because nil is its
+	// intended result. Mirrors the create/edit validation, which treats an empty assignee
+	// list as the whole circle.
+	assignees := chore.Assignees
+	if len(assignees) == 0 && chore.AssignStrategy != chModel.AssignmentStrategyNoAssignee {
+		for _, circleUser := range circleUsers {
+			assignees = append(assignees, chModel.ChoreAssignees{
+				ChoreID: chore.ID,
+				UserID:  circleUser.UserID,
+			})
+		}
+	}
+
 	assigneesMap := map[int]bool{}
-	for _, assignee := range chore.Assignees {
+	for _, assignee := range assignees {
 		assigneesMap[assignee.UserID] = true
 	}
 	var nextAssignee *int
@@ -3807,7 +4003,7 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 	case chModel.AssignmentStrategyLeastAssigned:
 		// find the assignee with the least number of chores
 		assigneeChores := map[int]int{}
-		for _, performer := range chore.Assignees {
+		for _, performer := range assignees {
 			assigneeChores[performer.UserID] = 0
 		}
 		for _, history := range history {
@@ -3836,7 +4032,7 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 	case chModel.AssignmentStrategyLeastCompleted:
 		// find the assignee who has completed the least number of chores
 		assigneeChores := map[int]int{}
-		for _, performer := range chore.Assignees {
+		for _, performer := range assignees {
 			assigneeChores[performer.UserID] = 0
 		}
 		for _, history := range history {
@@ -3863,8 +4059,8 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 			nextAssignee = &bestAssignee
 		}
 	case chModel.AssignmentStrategyRandom:
-		if len(chore.Assignees) > 0 {
-			assigneeID := chore.Assignees[rand.Intn(len(chore.Assignees))].UserID
+		if len(assignees) > 0 {
+			assigneeID := assignees[rand.Intn(len(assignees))].UserID
 			nextAssignee = &assigneeID
 		}
 	case chModel.AssignmentStrategyNoAssignee:
@@ -3874,8 +4070,8 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 		nextAssignee = chore.AssignedTo
 	case chModel.AssignmentStrategyRandomExceptLastAssigned:
 		var lastAssigned *int = chore.AssignedTo
-		AssigneesCopy := make([]chModel.ChoreAssignees, len(chore.Assignees))
-		copy(AssigneesCopy, chore.Assignees)
+		AssigneesCopy := make([]chModel.ChoreAssignees, len(assignees))
+		copy(AssigneesCopy, assignees)
 		var removeLastAssigned []chModel.ChoreAssignees
 		if lastAssigned != nil {
 			removeLastAssigned = remove(AssigneesCopy, *lastAssigned)
@@ -3885,15 +4081,19 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 		if len(removeLastAssigned) > 0 {
 			assigneeID := removeLastAssigned[rand.Intn(len(removeLastAssigned))].UserID
 			nextAssignee = &assigneeID
+		} else {
+			// only candidate is the last assignee (e.g. a single-member circle), so keep
+			// them rather than dropping the assignment
+			nextAssignee = chore.AssignedTo
 		}
 	case chModel.AssignmentStrategyRoundRobin:
-		if len(chore.Assignees) == 0 {
+		if len(assignees) == 0 {
 			return chore.AssignedTo, fmt.Errorf("no assignees available")
 		}
 
 		// Find current assignee index
 		currentIndex := -1
-		for i, assignee := range chore.Assignees {
+		for i, assignee := range assignees {
 			if chore.AssignedTo != nil && assignee.UserID == *chore.AssignedTo {
 				currentIndex = i
 				break
@@ -3903,10 +4103,10 @@ func checkNextAssignee(chore *chModel.Chore, choresHistory []*chModel.ChoreHisto
 		// If current assignee is not found, start from the beginning
 		var assigneeID int
 		if currentIndex == -1 {
-			assigneeID = chore.Assignees[0].UserID
+			assigneeID = assignees[0].UserID
 		} else {
-			nextIndex := (currentIndex + 1) % len(chore.Assignees)
-			assigneeID = chore.Assignees[nextIndex].UserID
+			nextIndex := (currentIndex + 1) % len(assignees)
+			assigneeID = assignees[nextIndex].UserID
 		}
 		nextAssignee = &assigneeID
 	default:
@@ -3952,6 +4152,9 @@ type NudgeRequest struct {
 //	@Security		APIKeyAuth
 //	@Param			id		path		int						true	"Chore ID"
 //	@Param			nudge	body		NudgeRequest			true	"Nudge request"
+//
+// TODO: Add response model
+//
 //	@Success		200		{object}	map[string]interface{}	"message: Nudge sent status"
 //	@Failure		400		{object}	map[string]string		"error: Invalid chore ID | Invalid request payload | Chore has no assignees | Cannot nudge yourself"
 //	@Failure		401		{object}	map[string]string		"error: Authentication failed"
@@ -4144,6 +4347,9 @@ func (h *Handler) sendNudgeToDevices(c context.Context, fcmTokens []string, titl
 //	@Security		JWTKeyAuth
 //	@Security		APIKeyAuth
 //	@Param			id	path		int						true	"Chore ID"
+//
+// TODO: Add response model
+//
 //	@Success		200	{object}	map[string]interface{}	"message: Successfully undid {action} action, res: updated chore object"
 //	@Failure		400	{object}	map[string]string		"error: Invalid chore ID | No recent action found to undo | Cannot undo this type of action"
 //	@Failure		401	{object}	map[string]string		"error: Authentication failed"
@@ -4323,9 +4529,9 @@ func getActionName(status chModel.ChoreHistoryStatus) string {
 func Routes(router *gin.Engine, h *Handler, multiAuthMiddleware *auth.MultiAuthMiddleware) {
 
 	// Input validation
-	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
-		v.RegisterStructValidation(ChoreReqStructLevelValidation, ChoreReq{})
-	}
+	// if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
+	// 	v.RegisterStructValidation(ChoreReqStructLevelValidation, ChoreReq{})
+	// }
 
 	choresRoutes := router.Group("api/v1/chores")
 	choresRoutes.Use(multiAuthMiddleware.MiddlewareFunc())

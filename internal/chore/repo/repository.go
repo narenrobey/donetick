@@ -174,13 +174,14 @@ func (r *ChoreRepository) GetChore(c context.Context, choreID int, userID int, c
 	if err := query.First(&chore).Error; err != nil {
 		return nil, err
 	}
+	r.db.WithContext(c).Where("entity_type = ? AND entity_id = ?", storageModel.EntityTypeChoreAttachment, choreID).Find(&chore.Attachments)
 	return &chore, nil
 }
 
 // GetChores retrieves chores for a user in a circle, respecting privacy and optionally filtered by sync version.
 // If syncOptions is nil or syncOptions.SyncVersion is nil, returns all visible chores ordered by next_due_date.
 // If syncOptions.SyncVersion is set, returns only chores with sync_version > *SyncVersion, ordered by sync_version.
-func (r *ChoreRepository) GetChores(c context.Context, circleID int, userID int, includeArchived bool, syncOptions *SyncOptions) ([]*chModel.Chore, error) {
+func (r *ChoreRepository) GetChores(c context.Context, circleID int, userID int, includeArchived bool, syncOptions *SyncOptions, includeSubtasks bool) ([]*chModel.Chore, error) {
 	var chores []*chModel.Chore
 
 	query := r.db.WithContext(c).
@@ -191,6 +192,9 @@ func (r *ChoreRepository) GetChores(c context.Context, circleID int, userID int,
 		Where(privacyPredicate(userID)).
 		Group("chores.id")
 
+	if includeSubtasks {
+		query = query.Preload("SubTasks")
+	}
 	if !includeArchived {
 		query = query.Where("chores.is_active = ?", true)
 	}
@@ -259,6 +263,9 @@ func (r *ChoreRepository) DeleteChore(c context.Context, id int) (int64, error) 
 		if err := tx.Where("entity_type = ? AND entity_id = ?", storageModel.EntityTypeChoreDescription, id).Delete(&storageModel.StorageFile{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("entity_type = ? AND entity_id = ?", storageModel.EntityTypeChoreAttachment, id).Delete(&storageModel.StorageFile{}).Error; err != nil {
+			return err
+		}
 		// Delete the chore itself
 		if err := tx.Delete(&chModel.Chore{}, id).Error; err != nil {
 			return err
@@ -286,12 +293,6 @@ func (r *ChoreRepository) SoftDelete(c context.Context, id int, userID int, circ
 		"is_active":    false,
 		"sync_version": nextVersion,
 	}).Error
-}
-
-func (r *ChoreRepository) IsChoreOwner(c context.Context, choreID int, userID int) error {
-	var chore chModel.Chore
-	err := r.db.WithContext(c).Model(&chModel.Chore{}).Where("id = ? AND created_by = ?", choreID, userID).First(&chore).Error
-	return err
 }
 
 func (r *ChoreRepository) SetChorePendingApproval(c context.Context, chore *chModel.Chore, note *string, userID int, completedDate *time.Time) error {
@@ -798,11 +799,11 @@ func (r *ChoreRepository) GetPreDueChoresForNotification(c context.Context, preD
 	return chores, nil
 }
 
-func readJSONBooleanField(dbType string, columnName string, fieldName string) string {
+func readJSONBooleanField(dbType string, columnName string, fieldName string) clause.Expr {
 	if dbType == "postgres" {
-		return fmt.Sprintf("(%s::json->>'%s')::boolean", columnName, fieldName)
+		return gorm.Expr("("+columnName+"::json->>?)::boolean", fieldName)
 	}
-	return fmt.Sprintf("JSON_EXTRACT(%s, '$.%s')", columnName, fieldName)
+	return gorm.Expr("JSON_EXTRACT("+columnName+", ?)", "$."+fieldName)
 }
 
 func (r *ChoreRepository) SetDueDate(c context.Context, choreID int, dueDate time.Time) error {
@@ -869,8 +870,8 @@ func (r *ChoreRepository) GetChoreDetailByID(c context.Context, choreID int, cir
 		Group("chores.id, recent_history.last_completed_date, recent_history.last_assigned_to, recent_history.last_completed_by, recent_history.notes, time_sessions.start_time, time_sessions.updated_at").
 		First(&choreDetail).Error; err != nil {
 		return nil, err
-
 	}
+	r.db.WithContext(c).Where("entity_type = ? AND entity_id = ?", storageModel.EntityTypeChoreAttachment, choreID).Find(&choreDetail.Attachments)
 	return &choreDetail, nil
 }
 
