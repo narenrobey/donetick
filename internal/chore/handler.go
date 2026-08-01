@@ -639,6 +639,160 @@ func (h *Handler) CreateChore(c *gin.Context) {
 	c.JSON(200, response)
 }
 
+// DuplicateChore creates a new chore that copies the definition (schedule, assignees,
+// labels, subtasks, etc.) of an existing one. The copy starts fresh: no history, no
+// timer/approval state, and its own attachments/description-image ownership.
+func (h *Handler) DuplicateChore(c *gin.Context) {
+	logger := logging.FromContext(c)
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		logger.Error("Failed to get current user from authentication context")
+		c.JSON(401, gin.H{
+			"error": "Authentication failed",
+		})
+		return
+	}
+
+	rawID := c.Param("id")
+	id, err := strconv.Atoi(rawID)
+	if err != nil {
+		logger.Error("Invalid chore ID format", "error", err, "rawID", rawID)
+		c.JSON(400, gin.H{
+			"error": "Invalid chore ID",
+		})
+		return
+	}
+
+	original, err := h.choreRepo.GetChore(c, id, currentUser.ID, currentUser.CircleID)
+	if err != nil {
+		logger.Error("Failed to retrieve chore", "error", err, "choreID", id, "userID", currentUser.ID)
+		c.JSON(404, gin.H{
+			"error": "Chore not found",
+		})
+		return
+	}
+
+	circleUsers, err := h.circleRepo.GetCircleUsers(c, currentUser.CircleID)
+	if err != nil {
+		logger.Error("Failed to retrieve circle users", "error", err, "circleID", currentUser.CircleID, "userID", currentUser.ID)
+		c.JSON(500, gin.H{"error": "Failed to retrieve circle users"})
+		return
+	}
+	if !original.CanView(currentUser.ID, circleUsers) {
+		c.JSON(403, gin.H{
+			"error": "You are not allowed to view this chore",
+		})
+		return
+	}
+
+	now := time.Now().UTC()
+	duplicated := &chModel.Chore{
+		Name:                   original.Name + " (Copy)",
+		FrequencyType:          original.FrequencyType,
+		Frequency:              original.Frequency,
+		FrequencyMetadataV2:    original.FrequencyMetadataV2,
+		NextDueDate:            original.NextDueDate,
+		IsRolling:              original.IsRolling,
+		AssignedTo:             original.AssignedTo,
+		AssignStrategy:         original.AssignStrategy,
+		IsActive:               true,
+		Notification:           original.Notification,
+		NotificationMetadataV2: original.NotificationMetadataV2,
+		CircleID:               currentUser.CircleID,
+		CreatedBy:              currentUser.ID,
+		UpdatedBy:              currentUser.ID,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+		Points:                 original.Points,
+		CompletionWindow:       original.CompletionWindow,
+		Description:            original.Description,
+		Priority:               original.Priority,
+		RequireApproval:        original.RequireApproval,
+		IsPrivate:              original.IsPrivate,
+		ProjectID:              original.ProjectID,
+	}
+
+	newID, err := h.choreRepo.CreateChore(c, duplicated)
+	if err != nil {
+		logger.Error("Failed to duplicate chore", "error", err, "choreID", id, "userID", currentUser.ID)
+		c.JSON(500, gin.H{
+			"error": "Failed to duplicate chore",
+		})
+		return
+	}
+	duplicated.ID = newID
+
+	if len(original.Assignees) > 0 {
+		var assignees []*chModel.ChoreAssignees
+		for _, a := range original.Assignees {
+			assignees = append(assignees, &chModel.ChoreAssignees{ChoreID: newID, UserID: a.UserID})
+		}
+		if err := h.choreRepo.UpdateChoreAssignees(c, assignees); err != nil {
+			logger.Error("Failed to copy assignees while duplicating chore", "error", err, "choreID", id, "newChoreID", newID)
+			c.JSON(500, gin.H{"error": "Failed to duplicate chore assignees"})
+			return
+		}
+	}
+
+	if original.LabelsV2 != nil && len(*original.LabelsV2) > 0 {
+		labelIDs := make([]int, len(*original.LabelsV2))
+		for i, label := range *original.LabelsV2 {
+			labelIDs[i] = label.ID
+		}
+		if err := h.lRepo.AssignLabelsToChore(c, newID, currentUser.ID, currentUser.CircleID, labelIDs, []int{}); err != nil {
+			logger.Error("Failed to copy labels while duplicating chore", "error", err, "choreID", id, "newChoreID", newID)
+			c.JSON(500, gin.H{"error": "Failed to duplicate chore labels"})
+			return
+		}
+	}
+
+	if original.SubTasks != nil && len(*original.SubTasks) > 0 {
+		if err := h.stRepo.UpdateSubtask(c, newID, nil, duplicateSubtasks(*original.SubTasks)); err != nil {
+			logger.Error("Failed to copy subtasks while duplicating chore", "error", err, "choreID", id, "newChoreID", newID)
+			c.JSON(500, gin.H{"error": "Failed to duplicate chore subtasks"})
+			return
+		}
+	}
+
+	go func() {
+		h.nPlanner.GenerateNotifications(c, duplicated)
+	}()
+
+	h.eventProducer.ChoreCreated(c, currentUser.WebhookURL, duplicated, &currentUser.User)
+
+	if h.realTimeService != nil {
+		broadcaster := h.realTimeService.GetEventBroadcaster()
+		broadcaster.BroadcastChoreCreated(duplicated, &currentUser.User)
+	}
+
+	c.JSON(200, gin.H{"res": newID})
+}
+
+// duplicateSubtasks builds fresh (uncompleted) copies of subtasks for insertion via
+// SubTasksRepository.UpdateSubtask, which treats any ID <= 0 as "insert new" and uses
+// it as a temporary key to resolve parent/child relationships within the same batch.
+func duplicateSubtasks(original []stModel.SubTask) []stModel.SubTask {
+	tempIDByOriginalID := make(map[int]int, len(original))
+	copies := make([]stModel.SubTask, len(original))
+	for i, st := range original {
+		tempID := -(i + 1)
+		tempIDByOriginalID[st.ID] = tempID
+		copies[i] = stModel.SubTask{
+			ID:      tempID,
+			OrderID: st.OrderID,
+			Name:    st.Name,
+		}
+	}
+	for i, st := range original {
+		if st.ParentId != nil {
+			if parentTempID, ok := tempIDByOriginalID[*st.ParentId]; ok {
+				copies[i].ParentId = &parentTempID
+			}
+		}
+	}
+	return copies
+}
+
 func setCreateChoreDefaults(choreReq *ChoreReq) []string {
 	warnings := []string{}
 
@@ -4543,6 +4697,7 @@ func Routes(router *gin.Engine, h *Handler, multiAuthMiddleware *auth.MultiAuthM
 		choresRoutes.PUT("/", h.EditChore)
 		choresRoutes.PUT("/:id/priority", h.UpdatePriority)
 		choresRoutes.POST("/", h.CreateChore)
+		choresRoutes.POST("/:id/duplicate", h.DuplicateChore)
 		choresRoutes.GET("/:id", h.GetChore)
 		choresRoutes.PUT("/:id/subtask", h.UpdateSubtaskCompletedAt)
 		choresRoutes.GET("/:id/details", h.GetChoreDetail)
