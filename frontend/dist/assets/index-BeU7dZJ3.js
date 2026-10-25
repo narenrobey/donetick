@@ -1,0 +1,2 @@
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/web-B9OyJdS3.js","assets/TermsView-Dmmex0h5.js","assets/index-BXN07VEk.js","assets/index-BCsfK3ul.css","assets/TermsView-DvB2Xm2x.css"])))=>i.map(i=>d[i]);
+import{_ as t}from"./index-BXN07VEk.js";import{dC as L}from"./TermsView-Dmmex0h5.js";class s extends Error{constructor(e,r){super(r),this.code=e,this.name="LocalLLMException"}}const a=L("LocalLLM",{web:()=>t(()=>import("./web-B9OyJdS3.js"),__vite__mapDeps([0,1,2,3,4])).then(o=>new o.LocalLLMWeb)});export{a as LocalLLM,s as LocalLLMException};

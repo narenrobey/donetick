@@ -1,0 +1,76 @@
+{
+  "redeem": "استبدال النقاط",
+  "redeemModal": {
+    "redeemButton": "استبدال",
+    "pointsAvailable": "{{count}} نقطة متاحة",
+    "pointsToRedeem": "النقاط المراد استبدالها",
+    "placeholder": "أدخل عدد النقاط...",
+    "cannotExceed": "لا يمكن تجاوز النقاط المتاحة",
+    "quickAdd": "إضافة سريعة:",
+    "aboutToRedeem": "أنت على وشك استبدال النقاط",
+    "amount": "{{count}} نقطة",
+    "remaining": "المتبقي: {{count}} نقطة"
+  },
+  "leaderboard": {
+    "titlePoints": "لائحة المتصدرين",
+    "titleTasks": "لائحة المتصدرين للمهام",
+    "subtitlePoints": "الترتيب بناء على النقاط المكتسبة خلال الفترة الزمنية المحددة",
+    "subtitleTasks": "التصنيف بناء على المهام المنجزة خلال الفترة الزمنية المحددة",
+    "modePoints": "النقاط",
+    "modeTasks": "مهام",
+    "you": "أنت",
+    "tasksAndAvg": "{{tasks}} مهام • متوسط {{avg}} لكل مهمة",
+    "available": "{{count}} نقطة متاحة",
+    "points_one": "{{count}} نقطة",
+    "points_other": "{{count}} نقاط"
+  },
+  "tabs": {
+    "short7d": "7D",
+    "short6m": "6 ميغا",
+    "shortAll": "الكل",
+    "days7": "آخر 7 أيام",
+    "months6": "6 أشهر",
+    "allTime": "كل الوقت",
+    "short30d": "30D",
+    "days30": "آخر 30 يومًا"
+  },
+  "filter": {
+    "analysisTitle": "تصفية النقاط وتحليلها",
+    "title": "تصفية النقاط",
+    "showFor": "إظهار النقاط لـ:",
+    "timePeriod": "الفترة الزمنية:"
+  },
+  "cards": {
+    "available": {
+      "title": "متاح",
+      "subtext": "جاهز للاستبدال"
+    },
+    "redeemed": {
+      "title": "مستبدلة",
+      "subtext": "تم استخدامها"
+    },
+    "total": {
+      "title": "المجموع",
+      "subtext": "المكتسبة طوال الوقت"
+    },
+    "period": {
+      "title": "نقاط الفترة",
+      "allTime": "كل الوقت",
+      "last6Months": "آخر 6 أشهر",
+      "lastDays_one": "آخر {{count}} يوم",
+      "lastDays_other": "آخر {{count}} أيام"
+    }
+  },
+  "summary": {
+    "showingFor": "عرض النقاط لـ",
+    "unknownUser": "مستخدم غير معروف",
+    "overThe": "خلال",
+    "allTime": "كل الوقت",
+    "last6Months": "آخر 6 أشهر",
+    "lastDays_one": "آخر {{count}} يوم",
+    "lastDays_other": "آخر {{count}} أيام"
+  },
+  "trend": {
+    "title": "اتجاه النقاط"
+  }
+}

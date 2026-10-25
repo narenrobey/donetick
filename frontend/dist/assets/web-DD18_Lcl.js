@@ -1,0 +1,1 @@
+import{ei as e}from"./TermsView-Dmmex0h5.js";import"./index-BXN07VEk.js";class i extends e{constructor(){super()}async checkSendIntentReceived(){return{title:""}}finish(){}}export{i as SendIntentWeb};
