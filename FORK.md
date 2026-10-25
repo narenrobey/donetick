@@ -82,6 +82,7 @@ git remote add upstream https://github.com/donetick/donetick.git
 
    ```bash
    git push --force-with-lease origin develop
+   git push origin $NEW      # so `git describe` works on other clones
    ```
 
    Other clones of `develop` then need `git fetch && git reset --hard origin/develop`.
