@@ -10,6 +10,7 @@ fork-only commits on top, so upgrading is "replay our commits onto the next rele
 | --- | --- |
 | Remove outside calls when in selfhost mode | `User.IsPlusMember()` always returns `true` (all plus features unlocked); OIDC avatar URL is no longer fetched over HTTP to validate it. |
 | Vendor self-hosted frontend build | Prebuilt `donetick/frontend` (`npm run build-selfhosted`) committed into `frontend/dist`, so `go build` / `docker build` serve the real UI. Source commit is in `frontend/FRONTEND_VERSION`. |
+| Don't log GORM record-not-found as errors | `IgnoreRecordNotFoundError: true` in `internal/database/database.go`, so expected empty lookups (e.g. completing a chore with no timer session) don't print a red `record not found` line. Real DB errors and slow queries are still logged. |
 
 Expected side effect: upstream tests that assert non-plus users are rejected
 (`internal/calendar` `TestManagementRoutes_RequirePlusMember`,

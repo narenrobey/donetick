@@ -46,7 +46,7 @@ func NewDatabase(cfg *config.Config) (*gorm.DB, error) {
 		logger.Config{
 			SlowThreshold:             200 * time.Millisecond, // Default Logger behavior
 			LogLevel:                  gormLogLevel,
-			IgnoreRecordNotFoundError: false,                        // Default Logger behavior
+			IgnoreRecordNotFoundError: true,                         // fork: expected empty lookups aren't errors
 			Colorful:                  true,                         // Default Logger behavior
 			ParameterizedQueries:      cfg.Logging.Level != "debug", // ParameterizedQueries=true => Don't show data in logs
 		},
